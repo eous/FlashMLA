@@ -35,14 +35,20 @@ def get_arch_flags():
 
     DISABLE_SM100 = is_flag_set("FLASH_MLA_DISABLE_SM100")
     DISABLE_SM90 = is_flag_set("FLASH_MLA_DISABLE_SM90")
-    if major < 12 or (major == 12 and minor <= 8):
-        assert DISABLE_SM100, "sm100 compilation for Flash MLA requires NVCC 12.9 or higher. Please set FLASH_MLA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."
+
+    if major < 12 or (major == 12 and minor < 9):
+        if not DISABLE_SM100:
+            DISABLE_SM100 = True
 
     arch_flags = []
     if not DISABLE_SM100:
         arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a"])
     if not DISABLE_SM90:
         arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
+
+    if not arch_flags:
+        raise RuntimeError("No valid GPU architectures enabled.")
+
     return arch_flags
 
 def get_nvcc_thread_args():
@@ -59,11 +65,13 @@ else:
     cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
 ext_modules = []
+
 ext_modules.append(
     CUDAExtension(
-        name="flash_mla.cuda",
+        name="_flashmla_C",  # Will be copied to vllm/ directory in Dockerfile
         sources=[
-            "csrc/pybind.cpp",
+            "csrc/pybind.cpp",  # Function implementations (sparse_prefill_fwd, etc)
+            "csrc/torch_api.cpp",  # TORCH_LIBRARY registration for torch.ops._flashmla_C
             "csrc/smxx/get_mla_metadata.cu",
             "csrc/smxx/mla_combine.cu",
             "csrc/sm90/decode/dense/splitkv_mla.cu",
@@ -73,6 +81,7 @@ ext_modules.append(
             "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
             "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
             "csrc/sm100/prefill/sparse/fwd.cu",
+            # SM120 files removed for GB200 validation (SM100 only)
         ],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
@@ -95,6 +104,46 @@ ext_modules.append(
         include_dirs=[
             Path(this_dir) / "csrc",
             Path(this_dir) / "csrc" / "sm90",
+            Path(this_dir) / "csrc" / "sm100",
+            Path(this_dir) / "csrc" / "cutlass" / "include",
+            Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+        ],
+    )
+)
+
+ext_modules.append(
+    CUDAExtension(
+        name="_flashmla_extension_C",  # Will be copied to vllm/ directory in Dockerfile
+        sources=[
+            "csrc/extension/sm90/dense_fp8/pybind.cpp",  # Function implementations
+            "csrc/extension/torch_api.cpp",  # TORCH_LIBRARY registration for torch.ops._flashmla_extension_C
+            "csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu",
+            "csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu",
+        ],
+        extra_compile_args={
+            "cxx": cxx_args + get_features_args(),
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "-DNDEBUG",
+                "-D_USE_MATH_DEFINES",
+                "-Wno-deprecated-declarations",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "--use_fast_math",
+                "--ptxas-options=-v,--register-usage-level=10"
+            ] + get_features_args() + get_arch_flags() + get_nvcc_thread_args(),
+        },
+        include_dirs=[
+            Path(this_dir) / "csrc",
+            Path(this_dir) / "csrc" / "sm90",
+            Path(this_dir) / "csrc" / "sm100",
+            Path(this_dir) / "csrc" / "sm120",
+            Path(this_dir) / "csrc" / "extension" / "sm90" / "dense_fp8",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
         ],
@@ -117,3 +166,4 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )
+

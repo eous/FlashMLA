@@ -44,13 +44,21 @@ do { \
 } while (0)
 #endif
 
-// For development, we define both IS_SM100 and IS_SM90 when using CLion or VSCode IDEs so code highlighting will be correct.
+// For development, we define IS_SM120, IS_SM100, and IS_SM90 when using CLion or VSCode IDEs so code highlighting will be correct.
 #if defined(__CLION_IDE__) || defined(__VSCODE_IDE__)
+#define IS_SM120 1
 #define IS_SM100 1
 #define IS_SM90 1
 #else
 
 // We define the following macros to detect the CUDA architecture, so that we can enable/disable certains kernels that depends on specific architectures.
+// SM120 (Blackwell workstation GPU, compute capability 12.0)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200)
+#define IS_SM120 1
+#else
+#define IS_SM120 0
+#endif
+
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
 #define IS_SM100 1
 #else

@@ -3,7 +3,10 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
+#if defined(NO_PYBIND11) && NO_PYBIND11 == 1
 #include <torch/python.h>
+#endif
+
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -36,12 +39,16 @@ struct Arch {
         return major == 10;
     }
 
+    bool is_sm120() const {
+        return major == 12;
+    }
+
     void assert_is_supported() const {
-        TORCH_CHECK(is_sm90() || is_sm100(), "Only SM90 and SM100 are supported");
+        TORCH_CHECK(is_sm90() || is_sm100() || is_sm120(), "Only SM90, SM100, and SM120 are supported");
     }
 };
 
-// DecodingAttnImplMeta - A struct to hold metadata for Decoding Attention Implementation (i.e. SM90 Dense BF16, SM90 Sparse FP8, etc.)
+// DecodingAttnImplMeta - A struct to hold metadata for Decoding Attention Implementation (i.e. Hopper Dense BF16, Hopper Sparse FP8, etc.)
 struct DecodingAttnImplMeta {
     int num_sm_parts;
     int fixed_overhead_num_blocks;
@@ -77,7 +84,11 @@ DecodingAttnImplMeta get_attn_impl_meta(
         } else {
             if (is_fp8_kvcache) {
                 // Dense FP8 MLA
-                TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM90");
+                return {
+                    std::max((sm_count/2) / h_k / cutlass::ceil_div(num_q_tokens_per_head_k, 2*64), 1),
+                    5,
+                    64
+                };
             } else {
                 // Dense BF16 MLA
                 return {
@@ -113,9 +124,34 @@ DecodingAttnImplMeta get_attn_impl_meta(
                 TORCH_CHECK(false, "BF16 Dence MLA is not supported on SM100");
             }
         }
+    } else if (arch.is_sm120()) {
+        // SM120 (Blackwell workstation GPU)
+        // Uses 128 threads (4 warps) with simple __syncthreads() synchronization
+        // Similar scheduling to SM90 FP8 sparse but with simplified thread model
+        if (is_sparse_attn) {
+            if (is_fp8_kvcache) {
+                TORCH_CHECK(h_q_.has_value());
+                int h_q = h_q_.value();
+                TORCH_CHECK(h_q % h_k == 0);
+                int s_q = num_q_tokens_per_head_k * h_k / h_q;
+                // SM120 FP8 + Sparse MLA
+                // Similar to SM90 but without cluster support
+                return {
+                    std::max(sm_count / h_k / (cutlass::ceil_div(h_q/h_k, 64) * s_q), 1),
+                    5,
+                    64
+                };
+            } else {
+                TORCH_CHECK(false, "Sparse BF16 MLA is not supported on SM120");
+            }
+        } else {
+            TORCH_CHECK(false, "Dense MLA is not supported on SM120 (use sparse attention)");
+        }
     } else {
         TORCH_CHECK(false, "Unsupported GPU architecture");
     }
+    // Unreachable - all paths above either return or throw
+    return DecodingAttnImplMeta{};
 }
 
 
@@ -263,8 +299,9 @@ fwd_kvcache_mla(
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
-    at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v}, opts);
-    at::Tensor softmax_lse = torch::empty({batch_size, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
+    // Initialize with zeros for deterministic behavior (all-invalid edge case)
+    at::Tensor out = torch::zeros({batch_size, q_seq_per_hk, num_heads, head_size_v}, opts);
+    at::Tensor softmax_lse = torch::zeros({batch_size, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
     CHECK_CONTIGUOUS(softmax_lse);
 
     DecodingParams params = {};
@@ -310,7 +347,10 @@ fwd_kvcache_mla(
     params.num_sm_parts = tile_scheduler_metadata.size(0);
     params.num_splits_ptr = num_splits.data_ptr<int>();
 
-    const int total_num_splits = batch_size + params.num_sm_parts;
+    // Get total splits from cumulative metadata array
+    // num_splits is cumulative: [0, splits_batch0, splits_batch0+splits_batch1, ...]
+    // The last element contains the total across all batches
+    const int total_num_splits = num_splits[batch_size].item<int>();
     at::Tensor softmax_lse_accum = torch::empty({total_num_splits, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
     at::Tensor out_accum = torch::empty({total_num_splits, num_heads, q_seq_per_hk, head_size_v}, opts.dtype(at::kFloat));
     CHECK_CONTIGUOUS(softmax_lse_accum);
@@ -334,7 +374,7 @@ fwd_kvcache_mla(
                 TORCH_CHECK(q_dtype == torch::kBFloat16, "Sparse FP8 MLA only supports BFloat16 on SM90");
                 sm90::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
             } else {
-                TORCH_CHECK(false, "Only FP8 kvcahe is supported for sparse MLA on SM90");
+                TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM90");
             }
         } else {
             if (is_fp8) {
@@ -347,7 +387,7 @@ fwd_kvcache_mla(
                     sm90::run_flash_splitkv_mla_kernel<cutlass::half_t>(params, stream);
 #endif
                 } else {
-                    TORCH_CHECK(false, "Unsupported dtype for dense MLA on SM90");
+                    TORCH_CHECK(false, "Unsupported tensor dtype for query");
                 }
             }
         }
@@ -394,7 +434,7 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9;
     bool is_sm100 = dprops->major == 10;
-    TORCH_CHECK(is_sm90 || is_sm100, "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM90 or SM100 architectures");
+    TORCH_CHECK(is_sm90 || is_sm100, "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM90 and SM100 architectures");
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(kv);
@@ -421,12 +461,13 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     auto opts = q.options();
-    at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
+    // Initialize with zeros for deterministic behavior (all-invalid edge case)
+    at::Tensor out = torch::zeros({s_q, h_q, d_v}, opts);
     CHECK_CONTIGUOUS(out);
-    
+
     at::Tensor buf_attn_score, max_logits, lse, p_sum;
-    max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
-    lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    max_logits = torch::zeros({s_q, h_q}, opts.dtype(torch::kFloat));
+    lse = torch::zeros({s_q, h_q}, opts.dtype(torch::kFloat));
     CHECK_CONTIGUOUS(max_logits);
     CHECK_CONTIGUOUS(lse);
 
@@ -461,7 +502,7 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 }
 
 
-
+#if defined(NO_PYBIND11) && NO_PYBIND11 == 1
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
     m.def("get_mla_decoding_metadata", &get_mla_decoding_metadata);
@@ -470,3 +511,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
 }
+#endif
